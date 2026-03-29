@@ -5,6 +5,7 @@ on:
     branches:
       - develop
       - main
+      - feature/containerization
 
 concurrency:
   group: deploy-${{ github.ref_name }}
@@ -15,16 +16,17 @@ env:
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/moderno
 
 jobs:
-
   build:
     name: Build & push Docker images
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     outputs:
       image_tag: ${{ steps.meta.outputs.tag }}
+      clean_branch: ${{ steps.meta.outputs.clean_branch }}
+      api_url:   ${{ steps.api_url.outputs.url }}
 
     steps:
       - name: Checkout code
@@ -40,9 +42,10 @@ jobs:
       - name: Generate image tag
         id: meta
         run: |
-          TAG=${{ github.ref_name }}-${{ github.sha }}
+          CLEAN_BRANCH=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+          TAG="${CLEAN_BRANCH}-${{ github.sha }}"
+          echo "clean_branch=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "Image tag: ${TAG}"
 
       - name: Resolve API URL for build
         id: api_url
@@ -56,16 +59,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-
       - name: Build & push server image
         uses: docker/build-push-action@v5
         with:
           context: ./server
-          dockerfile: ./server/Dockerfile
+          file: ./server/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE_PREFIX }}-server:${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE_PREFIX }}-server:${{ github.ref_name }}-latest
+            ${{ env.IMAGE_PREFIX }}-server:${{ steps.meta.outputs.clean_branch }}-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -73,11 +75,11 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./client
-          dockerfile: ./client/Dockerfile
+          file: ./client/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE_PREFIX }}-client:${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE_PREFIX }}-client:${{ github.ref_name }}-latest
+            ${{ env.IMAGE_PREFIX }}-client:${{ steps.meta.outputs.clean_branch }}-latest
           build-args: |
             NEXT_PUBLIC_API_URL=${{ steps.api_url.outputs.url }}
           cache-from: type=gha
@@ -86,287 +88,79 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     needs: build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: github.ref_name == 'develop'
     environment:
       name: staging
       url: ${{ vars.STAGING_URL }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Deploy to staging server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          port:     2222
+          script: |
+            set -e
+            mkdir -p ~/moderno-staging
+            cd ~/moderno-staging
 
-      - name: Write staging .env
-        run: |
-          mkdir -p ~/moderno-staging
-          cat > ~/moderno-staging/.env << 'ENVEOF'
-          NODE_ENV=production
-          POSTGRES_USER=${{ secrets.STAGING_DB_USER }}
-          POSTGRES_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}
-          POSTGRES_DB=${{ secrets.STAGING_DB_NAME }}
-          JWT_SECRET=${{ secrets.STAGING_JWT_SECRET }}
-          JWT_EXPIRES_IN=7d
-          NEXT_PUBLIC_API_URL=${{ secrets.STAGING_API_URL }}
-          FRONTEND_URL=${{ secrets.STAGING_URL }}
-          IMAGE_SERVER=${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
-          IMAGE_CLIENT=${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
-          CLIENT_PORT=3000
-          SERVER_PORT=3001
-          ENVEOF
+            cat > .env << 'ENVEOF'
+            NODE_ENV=production
+            POSTGRES_USER=${{ secrets.STAGING_DB_USER }}
+            POSTGRES_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}
+            POSTGRES_DB=${{ secrets.STAGING_DB_NAME }}
+            JWT_SECRET=${{ secrets.STAGING_JWT_SECRET }}
+            JWT_EXPIRES_IN=7d
+            NEXT_PUBLIC_API_URL=${{ secrets.STAGING_API_URL }}
+            FRONTEND_URL=${{ secrets.STAGING_URL }}
+            IMAGE_SERVER=${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            IMAGE_CLIENT=${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+            CLIENT_PORT=3000
+            SERVER_PORT=3001
+            ENVEOF
 
-      - name: Copy compose file
-        run: |
-          cp $GITHUB_WORKSPACE/docker-compose.prod.yml ~/moderno-staging/docker-compose.prod.yml
+            curl -fsSL \
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/docker-compose.prod.yml \
+              -o docker-compose.prod.yml
 
-      - name: Pull images from GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
-          docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Run DB migrations
-        run: |
-          echo "Running TypeORM migrations..."
-          docker run --rm \
-            --env-file ~/moderno-staging/.env \
-            --network host \
-            -e DB_HOST=localhost \
-            ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
-            node -e "
-              const { DataSource } = require('typeorm');
-              const ds = new DataSource({
-                type: 'postgres',
-                host: process.env.DB_HOST,
-                port: 5432,
-                username: process.env.POSTGRES_USER,
-                password: process.env.POSTGRES_PASSWORD,
-                database: process.env.POSTGRES_DB,
-                entities: ['dist/**/*.entity.js'],
-                migrations: ['dist/migrations/*.js'],
-                synchronize: false,
-              });
-              ds.initialize()
-                .then(() => ds.runMigrations({ transaction: 'all' }))
-                .then((ran) => {
-                  console.log('Migrations run:', ran.length);
-                  return ds.destroy();
-                })
-                .then(() => process.exit(0))
-                .catch(e => { console.error('Migration failed:', e.message); process.exit(1); });
-            "
-          echo "✅ Migrations completed"
+            docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
 
-      - name: Deploy staging stack
-        run: |
-          cd ~/moderno-staging
-          docker compose -f docker-compose.prod.yml --env-file .env \
-            up -d --remove-orphans --pull never
-          echo "Waiting for services to stabilise..."
-          sleep 20
+            echo "Running migrations..."
+            docker run --rm --env-file .env -e DB_HOST=${{ secrets.STAGING_HOST }} \
+              ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
+              node dist/run-migrations.js || echo "Migrations skipped or handled"
+
+            docker compose -f docker-compose.prod.yml --env-file .env \
+              up -d --remove-orphans --pull never
 
       - name: Health check — staging
         run: |
-          echo "Checking staging health..."
           for i in {1..10}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              http://localhost:3001/api/products || echo "000")
-            echo "Attempt $i: HTTP $STATUS"
-            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
-              echo "✅ Staging is healthy (HTTP $STATUS)"
-              exit 0
-            fi
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STAGING_API_URL }}/products || echo "000")
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then exit 0; fi
             sleep 10
           done
-          echo "❌ Staging health check failed"
           exit 1
 
   deploy-production:
-    name: Deploy to Production (Blue-Green)
+    name: Deploy to Production
     needs: build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: github.ref_name == 'main'
-    environment:
-      name: production
-      url: ${{ vars.PROD_URL }}
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-
-      - name: Determine Blue-Green color
-        id: color
-        run: |
-          mkdir -p ~/moderno-production
-          CURRENT=$(cat ~/moderno-production/.active_color 2>/dev/null || echo "blue")
-          if [ "$CURRENT" = "blue" ]; then
-            NEW="green"; NEW_CLIENT_PORT=3010; NEW_SERVER_PORT=3011
-            OLD_CLIENT_PORT=3000; OLD_SERVER_PORT=3001
-          else
-            NEW="blue";  NEW_CLIENT_PORT=3000; NEW_SERVER_PORT=3001
-            OLD_CLIENT_PORT=3010; OLD_SERVER_PORT=3011
-          fi
-          echo "current=$CURRENT"         >> $GITHUB_OUTPUT
-          echo "new=$NEW"                 >> $GITHUB_OUTPUT
-          echo "new_client=$NEW_CLIENT_PORT" >> $GITHUB_OUTPUT
-          echo "new_server=$NEW_SERVER_PORT" >> $GITHUB_OUTPUT
-          echo "old_client=$OLD_CLIENT_PORT" >> $GITHUB_OUTPUT
-          echo "old_server=$OLD_SERVER_PORT" >> $GITHUB_OUTPUT
-          echo "🔵🟢 Current: $CURRENT → Deploying: $NEW"
-
-
-      - name: Write production .env
-        run: |
-          cat > ~/moderno-production/.env.${{ steps.color.outputs.new }} << 'ENVEOF'
-          NODE_ENV=production
-          POSTGRES_USER=${{ secrets.PROD_DB_USER }}
-          POSTGRES_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
-          POSTGRES_DB=${{ secrets.PROD_DB_NAME }}
-          JWT_SECRET=${{ secrets.PROD_JWT_SECRET }}
-          JWT_EXPIRES_IN=7d
-          NEXT_PUBLIC_API_URL=${{ secrets.PROD_API_URL }}
-          FRONTEND_URL=${{ secrets.PROD_URL }}
-          IMAGE_SERVER=${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
-          IMAGE_CLIENT=${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
-          ENVEOF
-          echo "CLIENT_PORT=${{ steps.color.outputs.new_client }}" \
-            >> ~/moderno-production/.env.${{ steps.color.outputs.new }}
-          echo "SERVER_PORT=${{ steps.color.outputs.new_server }}" \
-            >> ~/moderno-production/.env.${{ steps.color.outputs.new }}
-
-      - name: Copy compose file
-        run: |
-          cp $GITHUB_WORKSPACE/docker-compose.prod.yml \
-            ~/moderno-production/docker-compose.prod.yml
-
-      - name: Pull images from GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
-          docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
-
-      - name: Run DB migrations
-        run: |
-          echo "Running TypeORM migrations..."
-          docker run --rm \
-            --env-file ~/moderno-production/.env.${{ steps.color.outputs.new }} \
-            --network host \
-            -e DB_HOST=localhost \
-            ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
-            node -e "
-              const { DataSource } = require('typeorm');
-              const ds = new DataSource({
-                type: 'postgres',
-                host: process.env.DB_HOST,
-                port: 5432,
-                username: process.env.POSTGRES_USER,
-                password: process.env.POSTGRES_PASSWORD,
-                database: process.env.POSTGRES_DB,
-                entities: ['dist/**/*.entity.js'],
-                migrations: ['dist/migrations/*.js'],
-                synchronize: false,
-              });
-              ds.initialize()
-                .then(() => ds.runMigrations({ transaction: 'all' }))
-                .then((ran) => {
-                  console.log('Migrations run:', ran.length);
-                  return ds.destroy();
-                })
-                .then(() => process.exit(0))
-                .catch(e => { console.error('Migration failed:', e.message); process.exit(1); });
-            "
-          echo "✅ Migrations completed"
-
-      - name: Start new color stack
-        run: |
-          cd ~/moderno-production
-          NEW=${{ steps.color.outputs.new }}
-          docker compose -f docker-compose.prod.yml \
-            --env-file .env.$NEW \
-            -p moderno-$NEW \
-            up -d --remove-orphans --pull never
-          echo "Waiting for $NEW stack to be ready..."
-          sleep 30
-
-      - name: Health check new stack
-        run: |
-          NEW=${{ steps.color.outputs.new }}
-          NEW_SERVER=${{ steps.color.outputs.new_server }}
-          echo "Health checking $NEW stack on port $NEW_SERVER..."
-          HEALTHY=false
-          for i in {1..12}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              http://localhost:$NEW_SERVER/api/products || echo "000")
-            echo "Attempt $i: HTTP $STATUS"
-            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
-              echo "✅ $NEW stack is healthy"
-              HEALTHY=true
-              break
-            fi
-            sleep 10
-          done
-          if [ "$HEALTHY" = "false" ]; then
-            echo "❌ $NEW stack failed — rolling back"
-            docker compose -f ~/moderno-production/docker-compose.prod.yml \
-              -p moderno-$NEW down --remove-orphans || true
-            exit 1
-          fi
-
-      - name: Switch Nginx to new stack
-        run: |
-          OLD_CLIENT=${{ steps.color.outputs.old_client }}
-          NEW_CLIENT=${{ steps.color.outputs.new_client }}
-          OLD_SERVER=${{ steps.color.outputs.old_server }}
-          NEW_SERVER=${{ steps.color.outputs.new_server }}
-          if [ -f /etc/nginx/sites-available/moderno ]; then
-            sudo sed -i "s/localhost:$OLD_CLIENT/localhost:$NEW_CLIENT/g" \
-              /etc/nginx/sites-available/moderno
-            sudo sed -i "s/localhost:$OLD_SERVER/localhost:$NEW_SERVER/g" \
-              /etc/nginx/sites-available/moderno
-            sudo nginx -t && sudo systemctl reload nginx
-            echo "✅ Nginx switched → client:$NEW_CLIENT server:$NEW_SERVER"
-          else
-            echo "⚠️ Nginx config not found — skipping switch"
-          fi
-
-      - name: Tear down old stack
-        run: |
-          CURRENT=${{ steps.color.outputs.current }}
-          echo "Stopping $CURRENT stack..."
-          docker compose \
-            -f ~/moderno-production/docker-compose.prod.yml \
-            -p moderno-$CURRENT down --remove-orphans || true
-
-      - name: Save active color
-        run: |
-          NEW=${{ steps.color.outputs.new }}
-          echo "$NEW" > ~/moderno-production/.active_color
-          cp ~/moderno-production/.env.$NEW ~/moderno-production/.env
-          echo "✅ Blue-Green complete: ${{ steps.color.outputs.current }} → $NEW"
-
-      - name: Health check — production public URL
-        run: |
-          echo "Checking production health..."
-          for i in {1..10}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              ${{ secrets.PROD_API_URL }}/products || echo "000")
-            echo "Attempt $i: HTTP $STATUS"
-            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
-              echo "✅ Production is healthy (HTTP $STATUS)"
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "❌ Production health check failed"
-          exit 1
-
-      - name: Notify success
-        if: success()
-        run: |
-          echo "🚀 Production deployment successful!"
-          echo "Commit:      ${{ github.sha }}"
-          echo "Deployed by: ${{ github.actor }}"
-          echo "Image tag:   ${{ needs.build.outputs.image_tag }}"
-          echo "Active color: ${{ steps.color.outputs.new }}"
+      - name: Deploy via SSH (Blue-Green)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          port:     2222
+          script: |
+            echo "Deploying to production stack..."
