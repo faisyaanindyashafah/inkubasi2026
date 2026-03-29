@@ -1,0 +1,120 @@
+networks:
+  moderno-network:
+    driver: bridge
+
+volumes:
+  postgres_data_dev:
+
+services:
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: moderno_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB:       moderno_db
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - moderno-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d moderno_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: builder
+    container_name: moderno_server_dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV:       development
+      PORT:           3001
+      DB_HOST:        postgres
+      DB_PORT:        5432
+      DB_USERNAME:    postgres
+      DB_PASSWORD:    postgres
+      DB_NAME:        moderno_db
+      JWT_SECRET:     f562a53306323b10a37a9dd78770d68f2c9048795f27c498f4515379dca3f0ad86e279ee4353b0e6627f984d6ac0487f8400571393bc2135ee2fe694e494c474
+      JWT_EXPIRES_IN: 7d
+      FRONTEND_URL:   http://localhost:3000
+    volumes:
+      - ./server:/app
+      - /app/node_modules
+    ports:
+      - "3001:3001"
+      - "9229:9229"
+    command: npm run start:dev
+    networks:
+      - moderno-network
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/api/products', (r) => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.2"
+          memory: 256M
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      target: builder
+    container_name: moderno_client_dev
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      NODE_ENV:                development
+      NEXT_PUBLIC_API_URL:     http://localhost:3001/api
+      NEXT_TELEMETRY_DISABLED: "1"
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    command: npm run dev
+    networks:
+      - moderno-network
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000', (r) => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.2"
+          memory: 256M
