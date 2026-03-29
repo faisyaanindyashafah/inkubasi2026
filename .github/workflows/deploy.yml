@@ -5,6 +5,7 @@ on:
     branches:
       - develop
       - main
+      - feature/containerization
 
 concurrency:
   group: deploy-${{ github.ref_name }}
