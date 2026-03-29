@@ -1,4 +1,23 @@
-build:
+name: CD — Moderno Deploy
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - feature/containerization
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/moderno
+
+jobs:
+
+  build:
     name: Build & push Docker images
     runs-on: ubuntu-latest
     permissions:
@@ -8,6 +27,7 @@ build:
     outputs:
       image_tag: ${{ steps.meta.outputs.tag }}
       clean_branch: ${{ steps.meta.outputs.clean_branch }}
+      api_url:   ${{ steps.api_url.outputs.url }}
 
     steps:
       - name: Checkout code
@@ -66,3 +86,100 @@ build:
             NEXT_PUBLIC_API_URL=${{ steps.api_url.outputs.url }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'develop'
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+
+    steps:
+      - name: Deploy to staging server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          port:     22
+          script: |
+            set -e
+
+            mkdir -p ~/moderno-staging
+            cd ~/moderno-staging
+
+            cat > .env << 'ENVEOF'
+            NODE_ENV=production
+            POSTGRES_USER=${{ secrets.STAGING_DB_USER }}
+            POSTGRES_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}
+            POSTGRES_DB=${{ secrets.STAGING_DB_NAME }}
+            JWT_SECRET=${{ secrets.STAGING_JWT_SECRET }}
+            JWT_EXPIRES_IN=7d
+            NEXT_PUBLIC_API_URL=${{ secrets.STAGING_API_URL }}
+            FRONTEND_URL=${{ secrets.STAGING_URL }}
+            IMAGE_SERVER=${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            IMAGE_CLIENT=${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+            CLIENT_PORT=3000
+            SERVER_PORT=3001
+            ENVEOF
+
+            curl -fsSL \
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/docker-compose.prod.yml \
+              -o docker-compose.prod.yml
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+
+            echo "Running TypeORM migrations..."
+            docker run --rm \
+              --env-file .env \
+              -e DB_HOST=${{ secrets.STAGING_HOST }} \
+              ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
+              node -e "
+                const { DataSource } = require('typeorm');
+                const ds = new DataSource({
+                  type: 'postgres',
+                  host: process.env.DB_HOST,
+                  port: 5432,
+                  username: process.env.POSTGRES_USER,
+                  password: process.env.POSTGRES_PASSWORD,
+                  database: process.env.POSTGRES_DB,
+                  entities: ['dist/**/*.entity.js'],
+                  migrations: ['dist/migrations/*.js'],
+                  synchronize: false,
+                });
+                ds.initialize()
+                  .then(() => ds.runMigrations({ transaction: 'all' }))
+                  .then((ran) => {
+                    console.log('Migrations run:', ran.length);
+                    return ds.destroy();
+                  })
+                  .then(() => process.exit(0))
+                  .catch(e => { console.error('Migration failed:', e.message); process.exit(1); });
+              "
+            echo "✅ Migrations completed"
+
+            docker compose -f docker-compose.prod.yml --env-file .env \
+              up -d --remove-orphans --pull never
+
+            sleep 20
+
+      - name: Health check — staging
+        run: |
+          echo "Checking staging health..."
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              ${{ secrets.STAGING_API_URL }}/products || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
+              echo "✅ Staging is healthy (HTTP $STATUS)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ Staging health check failed after 10 attempts"
