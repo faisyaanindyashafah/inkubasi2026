@@ -95,13 +95,19 @@ jobs:
       url: ${{ vars.STAGING_URL }}
 
     steps:
+      - name: Install Cloudflared on Runner
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
       - name: Deploy to staging server via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.STAGING_HOST }}
           username: ${{ secrets.STAGING_USER }}
           key:      ${{ secrets.STAGING_SSH_KEY }}
-          port:     2222
+          port:     22
+          proxy_command: /usr/local/bin/cloudflared access ssh --hostname %h
           script: |
             set -e
             mkdir -p ~/moderno-staging
@@ -132,14 +138,8 @@ jobs:
             docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
             docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
 
-            echo "Running migrations..."
-            docker run --rm --env-file .env -e DB_HOST=${{ secrets.STAGING_HOST }} \
-              ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
-              node dist/run-migrations.js || echo "Migrations skipped or handled"
-
             docker compose -f docker-compose.prod.yml --env-file .env \
               up -d --remove-orphans --pull never
-
       - name: Health check — staging
         run: |
           for i in {1..10}; do
