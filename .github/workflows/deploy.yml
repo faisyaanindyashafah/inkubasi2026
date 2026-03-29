@@ -16,7 +16,6 @@ env:
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/moderno
 
 jobs:
-
   build:
     name: Build & push Docker images
     runs-on: ubuntu-latest
@@ -103,13 +102,11 @@ jobs:
           host:     ${{ secrets.STAGING_HOST }}
           username: ${{ secrets.STAGING_USER }}
           key:      ${{ secrets.STAGING_SSH_KEY }}
-          port:     22
+          port:     2222
           script: |
             set -e
-
             mkdir -p ~/moderno-staging
             cd ~/moderno-staging
-
             cat > .env << 'ENVEOF'
             NODE_ENV=production
             POSTGRES_USER=${{ secrets.STAGING_DB_USER }}
@@ -124,17 +121,13 @@ jobs:
             CLIENT_PORT=3000
             SERVER_PORT=3001
             ENVEOF
-
             curl -fsSL \
               https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/docker-compose.prod.yml \
               -o docker-compose.prod.yml
-
             echo "${{ secrets.GITHUB_TOKEN }}" | \
               docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
             docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
             docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
-
             echo "Running TypeORM migrations..."
             docker run --rm \
               --env-file .env \
@@ -163,10 +156,8 @@ jobs:
                   .catch(e => { console.error('Migration failed:', e.message); process.exit(1); });
               "
             echo "✅ Migrations completed"
-
             docker compose -f docker-compose.prod.yml --env-file .env \
               up -d --remove-orphans --pull never
-
             sleep 20
 
       - name: Health check — staging
@@ -183,3 +174,118 @@ jobs:
             sleep 10
           done
           echo "❌ Staging health check failed after 10 attempts"
+          exit 1
+
+  deploy-production:
+    name: Deploy to Production (Blue-Green)
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'main'
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+
+    steps:
+      - name: Deploy to production via SSH (Blue-Green)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          port:     2222
+          script: |
+            set -e
+            mkdir -p ~/moderno-production
+            cd ~/moderno-production
+            CURRENT=$(cat .active_color 2>/dev/null || echo "blue")
+            if [ "$CURRENT" = "blue" ]; then
+              NEW="green"; NEW_CLIENT_PORT=3010; NEW_SERVER_PORT=3011
+              OLD_CLIENT_PORT=3000; OLD_SERVER_PORT=3001
+            else
+              NEW="blue";  NEW_CLIENT_PORT=3000; NEW_SERVER_PORT=3001
+              OLD_CLIENT_PORT=3010; OLD_SERVER_PORT=3011
+            fi
+            echo "🔵🟢 Current: $CURRENT → Deploying: $NEW"
+            cat > .env.$NEW << 'ENVEOF'
+            NODE_ENV=production
+            POSTGRES_USER=${{ secrets.PROD_DB_USER }}
+            POSTGRES_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
+            POSTGRES_DB=${{ secrets.PROD_DB_NAME }}
+            JWT_SECRET=${{ secrets.PROD_JWT_SECRET }}
+            JWT_EXPIRES_IN=7d
+            NEXT_PUBLIC_API_URL=${{ secrets.PROD_API_URL }}
+            FRONTEND_URL=${{ secrets.PROD_URL }}
+            IMAGE_SERVER=${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            IMAGE_CLIENT=${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+            ENVEOF
+            echo "CLIENT_PORT=$NEW_CLIENT_PORT" >> .env.$NEW
+            echo "SERVER_PORT=$NEW_SERVER_PORT" >> .env.$NEW
+            curl -fsSL \
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/docker-compose.prod.yml \
+              -o docker-compose.prod.yml
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }}
+            docker pull ${{ env.IMAGE_PREFIX }}-client:${{ needs.build.outputs.image_tag }}
+            echo "Running TypeORM migrations..."
+            docker run --rm \
+              --env-file .env.$NEW \
+              -e DB_HOST=${{ secrets.PROD_HOST }} \
+              ${{ env.IMAGE_PREFIX }}-server:${{ needs.build.outputs.image_tag }} \
+              node -e "
+                const { DataSource } = require('typeorm');
+                const ds = new DataSource({
+                  type: 'postgres',
+                  host: process.env.DB_HOST,
+                  port: 5432,
+                  username: process.env.POSTGRES_USER,
+                  password: process.env.POSTGRES_PASSWORD,
+                  database: process.env.POSTGRES_DB,
+                  entities: ['dist/**/*.entity.js'],
+                  migrations: ['dist/migrations/*.js'],
+                  synchronize: false,
+                });
+                ds.initialize()
+                  .then(() => ds.runMigrations({ transaction: 'all' }))
+                  .then((ran) => {
+                    console.log('Migrations run:', ran.length);
+                    return ds.destroy();
+                  })
+                  .then(() => process.exit(0))
+                  .catch(e => { console.error('Migration failed:', e.message); process.exit(1); });
+              "
+            echo "✅ Migrations completed"
+            docker compose -f docker-compose.prod.yml --env-file .env.$NEW \
+              -p moderno-$NEW up -d --remove-orphans --pull never
+            sleep 30
+            HEALTHY=false
+            for i in {1..12}; do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                http://localhost:$NEW_SERVER_PORT/api/products || echo "000")
+              if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then
+                HEALTHY=true
+                break
+              fi
+              sleep 10
+            done
+            if [ "$HEALTHY" = "false" ]; then
+              docker compose -f docker-compose.prod.yml -p moderno-$NEW down || true
+              exit 1
+            fi
+            if [ -f /etc/nginx/sites-available/moderno ]; then
+              sudo sed -i "s/localhost:$OLD_CLIENT_PORT/localhost:$NEW_CLIENT_PORT/g" /etc/nginx/sites-available/moderno
+              sudo sed -i "s/localhost:$OLD_SERVER_PORT/localhost:$NEW_SERVER_PORT/g" /etc/nginx/sites-available/moderno
+              sudo nginx -t && sudo systemctl reload nginx
+            fi
+            docker compose -f docker-compose.prod.yml -p moderno-$CURRENT down || true
+            echo "$NEW" > .active_color
+            cp .env.$NEW .env
+
+      - name: Health check — production
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.PROD_API_URL }}/products || echo "000")
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 500 ]; then exit 0; fi
+            sleep 15
+          done
+          exit 1
