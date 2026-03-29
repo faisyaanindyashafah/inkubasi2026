@@ -9,7 +9,6 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    container_name: moderno_postgres_prod
     restart: always
     environment:
       POSTGRES_USER:     ${POSTGRES_USER}
@@ -37,10 +36,7 @@ services:
           memory: 256M
 
   server:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-    container_name: moderno_server_prod
+    image: ${IMAGE_SERVER:-ghcr.io/changeme/moderno-server:latest}
     restart: always
     depends_on:
       postgres:
@@ -56,12 +52,12 @@ services:
       JWT_SECRET:     ${JWT_SECRET}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
       FRONTEND_URL:   ${FRONTEND_URL}
-    expose:
-      - "3001"
+    ports:
+      - "${SERVER_PORT:-3001}:3001"
     networks:
       - moderno-network
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/api', (r) => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/api/products', (r) => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
       interval: 20s
       timeout: 10s
       retries: 3
@@ -76,12 +72,7 @@ services:
           memory: 256M
 
   client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
-    container_name: moderno_client_prod
+    image: ${IMAGE_CLIENT:-ghcr.io/changeme/moderno-client:latest}
     restart: always
     depends_on:
       server:
@@ -91,7 +82,7 @@ services:
       NEXT_PUBLIC_API_URL:     ${NEXT_PUBLIC_API_URL}
       NEXT_TELEMETRY_DISABLED: "1"
     ports:
-      - "3000:3000"
+      - "${CLIENT_PORT:-3000}:3000"
     networks:
       - moderno-network
     healthcheck:
